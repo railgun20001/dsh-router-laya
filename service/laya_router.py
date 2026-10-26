@@ -183,6 +183,10 @@ def serve():
 def http_serve(port=8765):
     """HTTP mode: POST /judge {"task": "...", "prev_tier": ..., "prev_task": ...} -> judgment JSON.
 
+    `"preview": true` runs the same judgment but skips the /state history append, which is what the
+    composer's pre-send preview needs: it fires on every typing pause and must stay invisible to the
+    tier chip's real judgment log.
+
     协议自动检测：
       LAYA_MODEL 是本地目录 → 微调协议（7 noul 含 Q7 + 意图解析 + 规则引擎含规则0 + C3 升级 → tier）
       LAYA_MODEL 是仓库 id   → 基座协议（4分类 difficulty + domain 等）
@@ -192,7 +196,7 @@ def http_serve(port=8765):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     # Dependency-free guards, kept in their own file so http_guards.test.py can pin them without the
     # torch import this module pulls in through `laya`.
-    from http_guards import ExclusiveHTTPServer, is_allowed_origin
+    from http_guards import ExclusiveHTTPServer, is_allowed_origin, records_judgment
 
     model_path = os.environ.get(
         "LAYA_MODEL",
@@ -239,6 +243,11 @@ def http_serve(port=8765):
             prev_tier = body.get("prev_tier")  # 上一轮档位，inherit/升级用
             prev_task = body.get("prev_task")  # 上一轮任务文本，regenerate 检测用（plugin v2）
             session_id = body.get("session_id") or "default"
+            # 前端预览（输入框预判）：算档位，但不写 /state 的判定历史。
+            # 预判是"每停一次键盘就判一次"的调用，写进去会把 20 条真实判定记录挤掉；
+            # 判断本身与正式请求完全同一条路径，所以结果可以直接被随后那轮复用
+            # （见 index.js 的 previewHit）。
+            preview = bool(body.get("preview"))
             try:
                 if protocol == "finetuned":
                     j = ft_judge(agent, task, prev_tier=prev_tier, prev_task=prev_task)
@@ -248,7 +257,7 @@ def http_serve(port=8765):
                 j["protocol"] = protocol
             except Exception as e:
                 j = {"error": "%s: %s" % (type(e).__name__, e), "protocol": protocol}
-            if j.get("tier"):
+            if records_judgment(j, preview):
                 from collections import deque
                 log = judge_log.setdefault(session_id, deque(maxlen=20))
                 log.append({
@@ -259,6 +268,8 @@ def http_serve(port=8765):
                     "ms": j.get("ms"),
                     "task": (task or "")[:60],
                 })
+            if preview:
+                j["preview"] = True
             payload = json.dumps(j, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")

@@ -1,10 +1,10 @@
-"""Plain-script check for the two guards in http_guards.py (repo convention: no framework).
+"""Plain-script check for the guards in http_guards.py (repo convention: no framework).
 
     python service/http_guards.test.py
 
-Both guards are the defects reported in issues #2 and #3, and both are stdlib-only, so this runs
-without torch or a checkpoint: a second binder must be refused the port, and the desktop shell
-origin must be allowed to read /state.
+The first two guards are the defects reported in issues #2 and #3, and all of them are stdlib-only,
+so this runs without torch or a checkpoint: a second binder must be refused the port, the desktop
+shell origin must be allowed to read /state, and a preview must stay out of the history.
 """
 import os
 import sys
@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from http.server import BaseHTTPRequestHandler  # noqa: E402
 
-from http_guards import ExclusiveHTTPServer, is_allowed_origin  # noqa: E402
+from http_guards import ExclusiveHTTPServer, is_allowed_origin, records_judgment  # noqa: E402
 
 passed = 0
 failed = []
@@ -38,6 +38,13 @@ check("ipv6 loopback allowed", is_allowed_origin("http://[::1]:3080"))
 check("external origin refused", is_allowed_origin("https://example.com"), False)
 check("lookalike scheme refused", is_allowed_origin("dsh-appx://app"), False)
 check("missing origin refused", is_allowed_origin(None), False)
+
+# --- the /state history rule (composer preview: judged while typing, never recorded) ---
+tiered = {"tier": "high", "triggered_by": "laya"}
+check("a real judgement is recorded", records_judgment(tiered, False))
+check("a preview is NOT recorded", records_judgment(tiered, True), False)
+check("an answer with no tier is not recorded", records_judgment({"error": "boom"}, False), False)
+check("a preview error is not recorded", records_judgment({"error": "boom"}, True), False)
 
 # --- one owner per port (issue #2: SO_REUSEADDR let 11 Windows judges bind :8765 at once) ---
 first = ExclusiveHTTPServer(("127.0.0.1", 0), Quiet)

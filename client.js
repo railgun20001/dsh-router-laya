@@ -31,6 +31,27 @@ window.__ModuleLoader__.load({
     const POPOVER_LIMIT = 20
     const TASK_CHARS = 30
 
+    // ── composer preview (2026-10-26) ────────────────────────────────────────────────────────────
+    // While the user types, the chip shows the tier the draft WOULD get, so the knob is visible
+    // before the message is sent instead of only after. Three guards keep "preview" from turning
+    // into "a judgment per keystroke":
+    //
+    //   PREVIEW_DEBOUNCE_MS  quiet time after the last keystroke before a judgment is asked for
+    //   PREVIEW_SETTLE_MS    quiet time after an in-flight judgment settles before asking for the
+    //                        next one -- a slow judge plus fast typing must not queue inferences
+    //   PREVIEW_MIN_CHARS    below this there is nothing to judge (and "a"/"ab" are noise)
+    //
+    // Only ONE request is ever in flight; the newest draft supersedes the rest. The host reuses the
+    // returned verdict when that exact text is sent, so the preview also removes the judge from the
+    // send path.
+    const PREVIEW_URL = "/router-laya/preview"
+    const PREVIEW_DEBOUNCE_MS = 700
+    const PREVIEW_SETTLE_MS = 900
+    const PREVIEW_MIN_CHARS = 2
+    const PREVIEW_TEXT = { low: "预选 · 低", high: "预选 · 高", max: "预选 · MAX" }
+    const PREVIEW_PENDING_TEXT = "预选 · …"
+    const PREVIEW_TIP = "预选档位 · 按当前输入预判（点击切到手动）"
+
     const TIER_ORDER = { low: 0, high: 1, max: 2 }
     const TIER_COLOR = { low: "#3fb950", high: "#d29922", max: "#f85149" }
     const TIER_TEXT = { low: "AUTO · 低", high: "AUTO · 高", max: "AUTO · MAX" }
@@ -83,6 +104,7 @@ window.__ModuleLoader__.load({
   border:1px solid var(--dsw-alias-border-l1);box-shadow:0 10px 28px rgba(0,0,0,.18)}
 .routerLayaRow{display:flex;align-items:center;gap:7px;padding:3px 6px;border-radius:5px;font-size:11px;line-height:16px}
 .routerLayaRow:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.routerLayaPreviewRow{border:1px dashed var(--dsw-alias-border-l1)}
 .routerLayaTime{opacity:.55;font-variant-numeric:tabular-nums;flex:none}
 .routerLayaTask{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
 .routerLayaWhy{opacity:.6;flex:none}
@@ -209,6 +231,46 @@ window.__ModuleLoader__.load({
       return s.length > TASK_CHARS ? s.slice(0, TASK_CHARS) + "…" : s
     }
 
+    /**
+     * One popover row: time, tier dot, the task excerpt, and why it got that tier.
+     *
+     * Shared by the real history and the single preview row so the two read identically; the preview
+     * row is marked with a dashed border and a trailing 预选 tag, and carries no regenerate marker
+     * (nothing has run yet to retry).
+     */
+    function rowNode(row, key, preview) {
+      return React.createElement("div", {
+        key: key,
+        className: "routerLayaRow" + (preview ? " routerLayaPreviewRow" : ""),
+      },
+        React.createElement("span", { className: "routerLayaTime" }, clockOf(row.ts)),
+        React.createElement("span", {
+          className: "routerLayaDot",
+          style: { background: TIER_COLOR[row.tier] || OFFLINE_COLOR },
+        }),
+        React.createElement("span", { className: "routerLayaTask" }, clip(row.task)),
+        React.createElement("span", { className: "routerLayaWhy" },
+          reasonText(row.triggered_by)
+            + (row.regenerate === true ? " ↻" : "")
+            + (preview ? " · 预选" : "")),
+      )
+    }
+
+    /** The composer draft, from the shell's `InputState` snapshot. */
+    function selectDraft(snapshot) {
+      return snapshot !== undefined && snapshot !== null && typeof snapshot.draft === "string"
+        ? snapshot.draft
+        : ""
+    }
+
+    /**
+     * Stand-in for the shell's `useInput` when a build does not provide it: same call shape, no
+     * subscription, so the preview simply never arms instead of the chip failing to render.
+     */
+    function NO_DRAFT() {
+      return ""
+    }
+
     // ── spec §3 geometry: sit beside the model selector, copying its own shape ───────────────────
     //
     // ADAPTED (1 of 2): the spec gives a literal `translateX(-8px)`. In this composer the chip's cell
@@ -329,17 +391,142 @@ window.__ModuleLoader__.load({
       }
       React.useEffect(() => () => { if (hoverTimer[0] !== null) clearTimeout(hoverTimer[0]) }, [])
 
+      // ── composer preview (2026-10-26) ────────────────────────────────────────────────────────
+      //
+      // The live draft comes from the shell's standard `useInput` slot prop. The hook identity is
+      // fixed at mount on purpose: a build that does not provide it must degrade to "never preview"
+      // (the shipped behaviour) without ever changing this render's hook order.
+      //
+      // Held in an OBJECT, not directly: `React.useState(fn)` treats a function as a lazy
+      // initializer and would CALL it -- with no selector argument, and as a hook call in an
+      // initializer. Storing the hook behind a field keeps it a plain value.
+      const draftSource = React.useState({
+        use: props !== undefined && props !== null && typeof props.useInput === "function"
+          ? props.useInput
+          : NO_DRAFT,
+      })[0]
+      const draft = draftSource.use(selectDraft)
+      /** The preview verdict for one exact draft: { task, tier, triggered_by, ts }. */
+      const preview = React.useState(null)
+      const previewBusy = React.useState(false)
+      // The three values below change inside async callbacks, never in render, so they live in
+      // holders rather than state: a `React.useState` array is re-created by every render, which
+      // would let a timer scheduled one render earlier read a stale "not in flight" flag and start a
+      // second concurrent judgment.
+      /** Immediately-visible in-flight guard (the state above only drives what is painted). */
+      const inFlight = React.useState({ value: false })[0]
+      /** Newest draft that arrived while a judgment was in flight; judged once it settles. */
+      const wanted = React.useState({ value: null })[0]
+      const settle = React.useState({ timer: null })[0]
+      /** Mirrors the newest draft for the async response handler (no re-render, no stale closure). */
+      const latestDraft = React.useState({ value: "" })[0]
+      /**
+       * Latched when the host says the judge service cannot preview (it is older than this plugin,
+       * so a preview would land in the real history). Off for the rest of the page's life: the
+       * alternative is asking again on every typing pause for an answer that will not come.
+       */
+      const previewOff = React.useState(false)
+
+      const trimmed = typeof draft === "string" ? draft.trim() : ""
+      latestDraft.value = trimmed
+
+      // No preview in manual (nothing will be applied) or offline (nothing can judge).
+      const previewKey = offline || manual || previewOff[0] ? "" : trimmed
+      const previewArmed = previewKey.length >= PREVIEW_MIN_CHARS
+      // Only a verdict for the draft still in the box is shown; a stale one would be a lie.
+      const previewRow = preview[0] !== null && preview[0].task === previewKey ? preview[0] : null
+
+      const firePreview = (text) => {
+        if (inFlight.value) {
+          // One judgment at a time. Queue only the newest draft -- a slow judge plus fast typing
+          // must cost one inference per pause, not one per keystroke.
+          wanted.value = text
+          return
+        }
+        if (settle.timer !== null) { clearTimeout(settle.timer); settle.timer = null }
+        inFlight.value = true
+        previewBusy[1](true)
+        fetch(PREVIEW_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: sessionId === undefined ? null : sessionId, text: text }),
+        })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((json) => {
+            if (json === null) return
+            if (json.unsupported === true) {
+              previewOff[1](true)
+              preview[1](null)
+              return
+            }
+            if (typeof json.tier !== "string") return
+            // A verdict for a draft that is no longer in the box is noise: drop it and let the
+            // newer fire (or its queued follow-up) own the chip.
+            if (latestDraft.value !== text) return
+            preview[1]({
+              // Shaped like a history row (`task`/`tier`/`triggered_by`/`ts`) so the popover can
+              // render a preview with the same row component instead of a look-alike.
+              task: text,
+              tier: json.tier,
+              triggered_by: typeof json.triggeredBy === "string" ? json.triggeredBy : "",
+              ts: Date.now() / 1000,
+            })
+          })
+          .catch(() => { /* the /state poll owns the offline flag; keep the last preview shown */ })
+          .then(() => {
+            inFlight.value = false
+            previewBusy[1](false)
+            const next = wanted.value
+            wanted.value = null
+            if (next === null || next === text) return
+            if (next.length < PREVIEW_MIN_CHARS || next !== latestDraft.value) return
+            // Settle first: never fire the next judgment immediately on top of the previous one.
+            settle.timer = setTimeout(() => {
+              settle.timer = null
+              firePreview(next)
+            }, PREVIEW_SETTLE_MS)
+          })
+      }
+
+      React.useEffect(() => {
+        if (!previewArmed) {
+          // Clearing the box (a send, an erase) clears the preview: from here the chip shows the
+          // real judgment again, which for a fresh send is the tier that turn actually got.
+          if (preview[0] !== null) preview[1](null)
+          wanted.value = null
+          return undefined
+        }
+        if (previewRow !== null) return undefined
+        const timer = setTimeout(() => firePreview(previewKey), PREVIEW_DEBOUNCE_MS)
+        return () => clearTimeout(timer)
+      }, [previewKey, previewArmed, previewRow === null ? null : previewRow.task])
+
+      React.useEffect(() => () => {
+        if (settle.timer !== null) clearTimeout(settle.timer)
+      }, [])
+
       // spec §3: manual shows 手动 with the pinned tier when one is known; colour returns to the default
       // foreground (no tier colour is painted in manual).
       const manualText = tier === null ? MANUAL_TEXT : MANUAL_TEXT + " · " + TIER_SHORT[tier]
       const nothingYet = !offline && tier === null
-      const color = offline ? OFFLINE_COLOR : (manual || nothingYet ? null : TIER_COLOR[tier])
+      // 预选中：有当前草稿的判定，或者正在判定（此时点脉冲为灰，文字是 预选 · …）。
+      const previewBusyNow = !offline && !manual && previewArmed && previewRow === null && previewBusy[0]
+      const previewPaint = previewRow !== null || previewBusyNow
+      const color = offline || previewBusyNow
+        ? OFFLINE_COLOR
+        : (manual || (nothingYet && previewRow === null) ? null
+          : (previewRow !== null ? TIER_COLOR[previewRow.tier] : TIER_COLOR[tier]))
       const text = offline
         ? OFFLINE_TEXT
-        : (manual ? manualText : (nothingYet ? PENDING_TEXT : TIER_TEXT[tier]))
+        : (manual ? manualText
+          : (previewRow !== null ? (PREVIEW_TEXT[previewRow.tier] || PENDING_TEXT)
+            : (previewBusyNow ? PREVIEW_PENDING_TEXT
+              : (nothingYet ? PENDING_TEXT : TIER_TEXT[tier]))))
       const title = offline
         ? OFFLINE_TIP
-        : (manual ? "手动 · 点击恢复 Auto" : (nothingYet ? PENDING_TIP : "自动 · 点击切到手动"))
+        : (previewPaint
+          ? PREVIEW_TIP
+          : (manual ? "手动 · 点击恢复 Auto" : (nothingYet ? PENDING_TIP : "自动 · 点击切到手动")))
 
       const style = {
         height: "22px",
@@ -347,10 +534,11 @@ window.__ModuleLoader__.load({
         borderRadius: "999px",
         fontSize: "11px",
         lineHeight: "1",
-        border: "1px solid var(--dsw-alias-border-l1)",
-        color: offline || tier === null
-          ? OFFLINE_COLOR
-          : (manual ? "var(--dsw-alias-label-primary)" : color),
+        // A preview must not look like a commitment: dashed edge until the text is actually sent.
+        border: "1px " + (previewPaint ? "dashed" : "solid") + " var(--dsw-alias-border-l1)",
+        color: manual
+          ? "var(--dsw-alias-label-primary)"
+          : (color === null ? OFFLINE_COLOR : color),
         fontWeight: manual ? 400 : 600,
         transform: "translateX(" + String(offset[0]) + "px)",
       }
@@ -385,22 +573,18 @@ window.__ModuleLoader__.load({
             className: "routerLayaToast" + (toastOut[0] ? " routerLayaToastOut" : ""),
           }, toast[0])
 
-      const popoverNode = popover[0] && rows.length > 0
-        ? React.createElement("div", { className: "routerLayaPopover" },
-            rows.slice(-POPOVER_LIMIT).reverse().map((row, index) => React.createElement("div", {
-              key: String(row.ts) + ":" + String(index),
-              className: "routerLayaRow",
-            },
-              React.createElement("span", { className: "routerLayaTime" }, clockOf(row.ts)),
-              React.createElement("span", {
-                className: "routerLayaDot",
-                style: { background: TIER_COLOR[row.tier] || OFFLINE_COLOR },
-              }),
-              React.createElement("span", { className: "routerLayaTask" }, clip(row.task)),
-              React.createElement("span", { className: "routerLayaWhy" },
-                reasonText(row.triggered_by) + (row.regenerate === true ? " ↻" : "")),
-            )))
-        : null
+      // While a preview is on screen the list is EXACTLY one row -- the preview itself. The 20-entry
+      // history is a record of judged turns; mixing a draft's verdict into it would make one
+      // conversation look like it had been routed a dozen times.
+      const popoverNode = !popover[0]
+        ? null
+        : (previewRow !== null
+          ? React.createElement("div", { className: "routerLayaPopover" }, rowNode(previewRow, "preview", true))
+          : (rows.length > 0
+            ? React.createElement("div", { className: "routerLayaPopover" },
+                rows.slice(-POPOVER_LIMIT).reverse().map((row, index) => rowNode(
+                  row, String(row.ts) + ":" + String(index), false)))
+            : null))
 
       return React.createElement("div", {
         style: { position: "relative", display: "inline-flex", alignItems: "center" },
@@ -424,6 +608,8 @@ window.__ModuleLoader__.load({
         { name: "conversation.input.right", id: "router-laya-tier", order: 5 },
         (slotProps) => React.createElement(Chip, {
           sessionId: slotProps === undefined || slotProps === null ? undefined : slotProps.sessionId,
+          // The standard props channel: `useInput` is how the chip sees the draft being typed.
+          useInput: slotProps === undefined || slotProps === null ? undefined : slotProps.useInput,
         }),
       ))
     }

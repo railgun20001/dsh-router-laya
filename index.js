@@ -712,13 +712,17 @@ export async function judgeDifficulty(ctx, taskText, sessionId, signal) {
  * TIER_TABLE.fallback (deepseek review F2: "never break the session" means the fallback ROUTE
  * here; a route the profile cannot serve is handled separately by `usableRoute`).
  */
-export async function judgeTier(taskText, prevTier, prevTask, sessionId, signal) {
+export async function judgeTier(taskText, prevTier, prevTask, sessionId, signal, options) {
   if (taskText === null || taskText === '') return null;
   const url = process.env.LAYA_ROUTER_URL || 'http://127.0.0.1:8765/judge';
   const timeout = AbortSignal.timeout(JUDGE_TIMEOUT_MS);
   if (signal !== undefined && typeof signal.addEventListener === 'function') {
     signal.addEventListener('abort', () => timeout.abort?.(), { once: true });
   }
+  // `preview` asks the Python side for the same judgment without recording it in /state: the
+  // composer preview fires on every typing pause, and its rows must not push the real judgments out
+  // of that 20-entry history (see installPreviewRoute).
+  const preview = options !== undefined && options !== null && options.preview === true;
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -728,6 +732,7 @@ export async function judgeTier(taskText, prevTier, prevTask, sessionId, signal)
         prev_tier: prevTier === undefined ? null : prevTier,
         prev_task: prevTask === undefined ? null : prevTask,
         session_id: sessionId === undefined ? null : sessionId,
+        ...(preview ? { preview: true } : {}),
       }),
       signal: timeout,
     });
@@ -744,11 +749,188 @@ export async function judgeTier(taskText, prevTier, prevTask, sessionId, signal)
       log(`Laya router returned no tier`);
       return null;
     }
+    // `preview_ack`: the service echoes `preview: true` only when it understood the flag and skipped
+    // its /state append. An older service answers normally and would record the preview as a real
+    // judgment, so the route uses this to stop previewing instead of quietly corrupting the history.
+    if (preview) {
+      return {
+        tier: j.tier,
+        triggered_by: j.triggered_by || '',
+        labels: j.labels || null,
+        preview_ack: j.preview === true,
+      };
+    }
     return { tier: j.tier, triggered_by: j.triggered_by || '', labels: j.labels || null };
   } catch (e) {
     log(`Laya router call failed: ${e.message}`);
     return null;
   }
+}
+
+/**
+ * Composer preview (2026-10-26): judge the draft before it is sent, and reuse that verdict when it
+ * finally is.
+ *
+ * Two requirements pull in opposite directions. "Show me the tier while I type" wants a judgment per
+ * typing pause; "do not judge forever" and "one history row" want almost none. The split used here:
+ *
+ *   - The CLIENT owns the throttle (debounce, one request in flight, min settle gap). It is the only
+ *     side that can see the keystrokes, so a quiet-time policy belongs there.
+ *   - The HOST owns the two invariants the client cannot enforce: the preview never reaches /state
+ *     (`judgeTier(..., { preview: true })`), and a send that follows a preview does not pay the
+ *     judge a second time.
+ *
+ * The reuse is an EQUIVALENCE, not a shortcut: the judge is a pure function of (text, prev tier,
+ * prev task), so a cached verdict whose three inputs still match is the answer the request would
+ * have computed anyway. Anything that moved -- a turn completed, the user sent the same text again
+ * (regenerate detection reads prev_task) -- fails the comparison and falls through to a real judge.
+ */
+const PREVIEW_TTL_MS = 10 * 60 * 1000;
+/** Nothing above this is judged: it is a paste, not a question in progress. */
+const PREVIEW_BODY_LIMIT = 64 * 1024;
+/** How many session previews to keep; one small object each, and sessions are few. */
+const PREVIEW_CACHE_LIMIT = 128;
+
+/**
+ * The cached preview this request may reuse, or null.
+ *
+ * `text` must already be truncation-normalised by the caller (both sides slice with
+ * JUDGE_MAX_CHARS), and `prevTier`/`prevTask` follow `judgeTier`'s convention -- `undefined` means
+ * "no previous turn", which compares equal to the `null` stored by the route.
+ */
+export function previewHit(entry, text, prevTier, prevTask, now, ttlMs = PREVIEW_TTL_MS) {
+  if (entry === null || entry === undefined) return null;
+  if (typeof entry.tier !== 'string' || entry.tier === '') return null;
+  if (entry.text !== text) return null;
+  if (entry.prevTier !== (prevTier === undefined ? null : prevTier)) return null;
+  if (entry.prevTask !== (prevTask === undefined ? null : prevTask)) return null;
+  if (typeof now !== 'number' || typeof entry.at !== 'number') return null;
+  if (now - entry.at > ttlMs) return null;
+  return { tier: entry.tier, triggered_by: entry.triggered_by || '' };
+}
+
+/**
+ * Serve the composer preview over the web carrier, same-origin, next to the mode route.
+ *
+ *   POST {sessionId, text} -> `{tier, triggeredBy}` | `{unavailable: true}` | `{unsupported: true}`
+ *                             | `{mode: 'manual'}`
+ *
+ * Same-origin is the point: the judge service is a loopback process with a deliberately narrow CORS
+ * allowlist (it echoes prompt text), so opening it to the page for a keystroke stream is exactly the
+ * door not to open. The host half already talks to the judge, and it is the only place that knows
+ * the session's previous tier/task -- which the preview must pass through, or a preview of "继续"
+ * would answer differently from the send that follows it.
+ *
+ * `manual` answers instead of judging: the chip shows no tier in manual mode, so a preview there
+ * would be a promise the next request will not keep.
+ */
+function installPreviewRoute(ctx, deps) {
+  const handler = createPreviewHandler(deps);
+  ctx.inject(['webServer'], (scoped) => {
+    const webServer = scoped.get('webServer');
+    if (webServer === undefined || webServer === null) return;
+    scoped.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/router-laya/preview',
+      handler,
+    }));
+  });
+}
+
+/**
+ * The preview route's handler, split out so the offline tests can drive it with a fake req/res.
+ *
+ * `deps`: `{ sessionState: Map, cache: Map, manual: () => boolean, stale: { value: boolean } }` --
+ * the session's previous tier/task and the reuse cache, both owned by `apply()`, plus the
+ * "judge service is too old to preview" latch.
+ */
+export function createPreviewHandler(deps) {
+  return (req, res) => {
+    const send = (code, body) => {
+      const text = JSON.stringify(body);
+      res.statusCode = code;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Length', String(Buffer.byteLength(text)));
+      res.end(text);
+    };
+    if (req.method !== 'POST') {
+      send(405, { error: 'method not allowed' });
+      return;
+    }
+    if (deps.manual()) {
+      send(200, { mode: 'manual' });
+      return;
+    }
+    if (deps.stale.value) {
+      // Known-stale judge service (see preview_ack below): answering without judging stops the
+      // client from asking again on every typing pause.
+      send(200, { unsupported: true });
+      return;
+    }
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > PREVIEW_BODY_LIMIT) req.destroy();
+    });
+    // `end`, not `close`: a browser that aborts a superseded preview must not leave the handler
+    // half-run, and the judgment itself is worth keeping for the reuse cache even then.
+    req.on('end', () => {
+      Promise.resolve().then(async () => {
+        let body;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          send(400, { error: 'body must be json' });
+          return;
+        }
+        const draft = body !== null && typeof body.text === 'string' ? body.text.trim() : '';
+        if (draft === '') {
+          send(400, { error: 'text is empty' });
+          return;
+        }
+        const key = typeof body.sessionId === 'string' && body.sessionId !== ''
+          ? body.sessionId : 'global';
+        const state = deps.sessionState.get(key);
+        const prevTier = state === undefined ? undefined : state.tier;
+        const prevTask = state === undefined ? undefined : state.task;
+        const task = draft.slice(0, JUDGE_MAX_CHARS);
+        const judgment = await judgeTier(task, prevTier, prevTask,
+          key === 'global' ? undefined : key, undefined, { preview: true });
+        if (judgment === null) {
+          // Unreachable judge: say so and let the chip keep its last real tier -- this must not
+          // look like a routing decision, and the /state poll owns the offline flag.
+          send(200, { unavailable: true });
+          return;
+        }
+        if (judgment.preview_ack !== true) {
+          // The judge understood the request but not the flag, i.e. it is older than this plugin and
+          // would have written the preview into its /state history. Preview is off until it restarts;
+          // one log line, then the client is told once and stops asking.
+          log('judge service does not support previews (restart it) -- preview disabled');
+          deps.stale.value = true;
+          send(200, { unsupported: true });
+          return;
+        }
+        deps.cache.set(key, {
+          text: task,
+          prevTier: prevTier === undefined ? null : prevTier,
+          prevTask: prevTask === undefined ? null : prevTask,
+          tier: judgment.tier,
+          triggered_by: judgment.triggered_by,
+          at: Date.now(),
+        });
+        if (deps.cache.size > PREVIEW_CACHE_LIMIT) {
+          // Oldest-first: insertion order is chronological, and one stale entry per session is
+          // all this cache ever holds.
+          const oldest = deps.cache.keys().next();
+          if (oldest.done !== true) deps.cache.delete(oldest.value);
+        }
+        send(200, { tier: judgment.tier, triggeredBy: judgment.triggered_by });
+      }).catch((error) => {
+        send(500, { error: String(error && error.message ? error.message : error) });
+      });
+    });
+  };
 }
 
 /**
@@ -993,6 +1175,22 @@ export function apply(ctx, config) {
    * the tier we served and the task text we served it for, feeding the next turn's
    * prev_tier/prev_task (regenerate detection + C3 escalation). */
   const sessionState = new Map();
+  /** session key -> the newest composer preview {text, prevTier, prevTask, tier, triggered_by, at},
+   * so the send that follows a preview reuses its verdict instead of judging the same text twice
+   * (see previewHit). */
+  const previewCache = new Map();
+  /**
+   * The composer preview channel. Installed here rather than beside the mode route because it reads
+   * `sessionState` -- it must pass the same prev_tier/prev_task the request path will use, or the
+   * preview would answer a different question than the send does. Auto only: manual mode never
+   * applies a tier, so it has nothing to preview.
+   */
+  const previewStale = { value: false };
+  if (auto) {
+    installPreviewRoute(ctx, {
+      sessionState, cache: previewCache, manual: isManual, stale: previewStale,
+    });
+  }
   const keyOf = (payload) => {
     const session = payload && payload.agent && payload.agent.session;
     return (session && (session.id || session.sessionId)) || 'global';
@@ -1058,10 +1256,20 @@ export function apply(ctx, config) {
       const state = prev !== undefined && (turn === undefined || prev.turn === undefined || turn >= prev.turn)
         ? prev
         : undefined;
+      // A preview taken while this text was still being typed already answered this exact question
+      // (same text, same prev tier/task) -- reuse it instead of paying the judge twice. Any drift in
+      // those three inputs, or a preview older than the TTL, falls through to a real judgement.
+      const preview = task === undefined
+        ? null
+        : previewHit(previewCache.get(key), task.text,
+          state === undefined ? undefined : state.tier,
+          state === undefined ? undefined : state.task,
+          Date.now());
       const judgment = task === undefined
         ? null
-        : await judgeTier(task.text, state ? state.tier : undefined, state ? state.task : undefined,
-          task.sessionId, payload && payload.signal);
+        : (preview !== null ? preview : await judgeTier(task.text,
+          state ? state.tier : undefined, state ? state.task : undefined,
+          task.sessionId, payload && payload.signal));
       // Fail-safe, two branches (plan §4.4): /judge unreachable -> the fallback ROUTE (low);
       // a route this profile cannot serve -> leave the request on its own config (usableRoute
       // returns null, v1 semantics -- NOT the fallback).
@@ -1087,7 +1295,8 @@ export function apply(ctx, config) {
         });
       }
       log(`turn ${turn} auto "${task === undefined ? '(no task text captured)' : task.text.slice(0, 60).replace(/\s+/g, ' ')}"`
-        + ` -> ${judgment === null ? 'judge unreachable -> fallback' : `${judgment.tier} (${judgment.triggered_by})`} -> `
+        + ` -> ${judgment === null ? 'judge unreachable -> fallback' : `${judgment.tier} (${judgment.triggered_by})`}`
+        + `${preview !== null ? ' [预判复用]' : ''} -> `
         + (route === null ? 'left on its own config' : routeLabel(route)));
       return route === null ? config : applyRoute(config, route);
     }
