@@ -3,10 +3,11 @@
 // Python service. Plain-script check, repo convention (see parseArm.test.mjs).
 //
 //     node auto.test.mjs
-import { applyRoute, clampEffort, clampRouteToModel, Config, inheritsModel, isOurRoute, MODE_NS,
-  mountMode, nextSessionState, resolveModeEntryId, resolveSchedule, serviceBaseUrl, serviceLaunchSpec,
-  supportedEffortIds, TIER_TABLE } from './index.js';
+import { apply, applyRoute, clampEffort, clampRouteToModel, Config, createPreviewHandler, inheritsModel,
+  isOurRoute, judgeTier, MODE_NS, mountMode, nextSessionState, previewHit, resolveModeEntryId,
+  resolveSchedule, serviceBaseUrl, serviceLaunchSpec, supportedEffortIds, TIER_TABLE } from './index.js';
 import { isVolatile } from '@deepseek-ai/cosmokit';
+import { EventEmitter } from 'node:events';
 
 let pass = 0;
 const fail = [];
@@ -248,6 +249,228 @@ check('isOurRoute: foreign effort is not ours',
   isOurRoute({ reasoningEffort: 'medium' }, { tier: 'low', effort: 'high' }, inheritedTiers), false);
 check('isOurRoute: falls back to the row effort when the state has none',
   isOurRoute({ reasoningEffort: 'low' }, { tier: 'low' }, inheritedTiers), true);
+
+// ── composer preview (2026-10-26) ─────────────────────────────────────────────────────────────
+// previewHit decides whether a preview taken while typing may answer the send that follows. The
+// judge is a pure function of (text, prev tier, prev task), so "all three still match" is the only
+// safe reuse condition -- and the reason is worth pinning: sending the same text twice is a RETRY,
+// which must escalate via regenerate detection even though the text is unchanged.
+const AT = 1700000000000;
+const preview = {
+  text: '帮我优化一下', prevTier: 'low', prevTask: '写个函数', tier: 'high', triggered_by: 'laya', at: AT,
+};
+check('previewHit: same three inputs -> reuse',
+  previewHit(preview, '帮我优化一下', 'low', '写个函数', AT + 1000),
+  { tier: 'high', triggered_by: 'laya' });
+check('previewHit: edited draft -> no reuse',
+  previewHit(preview, '帮我优化一下!', 'low', '写个函数', AT + 1000), null);
+check('previewHit: previous tier moved -> no reuse',
+  previewHit(preview, '帮我优化一下', 'high', '写个函数', AT + 1000), null);
+check('previewHit: previous task moved (the same text sent again is a retry) -> no reuse',
+  previewHit(preview, '帮我优化一下', 'low', '帮我优化一下', AT + 1000), null);
+check('previewHit: older than the ttl -> no reuse',
+  previewHit(preview, '帮我优化一下', 'low', '写个函数', AT + 5000, 1000), null);
+check('previewHit: no preview taken -> null',
+  previewHit(undefined, '帮我优化一下', 'low', '写个函数', AT), null);
+// First turn: the route stores null for "no previous turn", which must compare equal to judgeTier's
+// `undefined` -- otherwise every first message would judge twice.
+check('previewHit: first turn null/undefined equivalence',
+  previewHit({ text: 'hi', prevTier: null, prevTask: null, tier: 'low', triggered_by: 'laya', at: AT },
+    'hi', undefined, undefined, AT),
+  { tier: 'low', triggered_by: 'laya' });
+
+// judgeTier: the preview flag has to reach the wire -- it is what tells the Python side not to
+// append the preview to the /state history.
+const realFetch = globalThis.fetch;
+let sent = null;
+globalThis.fetch = async (url, init) => {
+  sent = { url: String(url), body: JSON.parse(init.body) };
+  // The service acknowledges a preview by echoing the flag (that is what tells the host the preview
+  // stayed out of the /state history).
+  const ack = sent.body.preview === true ? { preview: true } : {};
+  return { ok: true, json: async () => ({ tier: 'high', triggered_by: 'laya', ...ack }) };
+};
+try {
+  const judged = await judgeTier('帮我优化一下', 'low', '写个函数', 's1', undefined, { preview: true });
+  check('judgeTier: preview verdict parsed',
+    judged, { tier: 'high', triggered_by: 'laya', labels: null, preview_ack: true });
+  check('judgeTier: preview flag on the wire', sent.body.preview, true);
+  check('judgeTier: prev pair on the wire',
+    [sent.body.prev_tier, sent.body.prev_task], ['low', '写个函数']);
+  const realJudged = await judgeTier('帮我优化一下', undefined, undefined, undefined, undefined, undefined);
+  check('judgeTier: a real judgement carries no preview flag', sent.body.preview, undefined);
+  check('judgeTier: a real judgement has no preview ack key', 'preview_ack' in realJudged, false);
+  check('judgeTier: no previous turn is null, not undefined',
+    [sent.body.prev_tier, sent.body.prev_task], [null, null]);
+} finally {
+  globalThis.fetch = realFetch;
+}
+
+// ── the preview route (same-origin /router-laya/preview) ─────────────────────────────────────
+// Driven through the real handler with a fake req/res, so the shapes the browser half depends on
+// (manual mode, empty draft, unreachable judge, cache write) are pinned rather than assumed.
+function callPreview(handler, options) {
+  const opts = options === undefined ? {} : options;
+  return new Promise((resolve) => {
+    const req = new EventEmitter();
+    req.method = opts.method === undefined ? 'POST' : opts.method;
+    req.destroy = () => {};
+    const res = {
+      statusCode: 0,
+      headers: {},
+      setHeader(name, value) { this.headers[name.toLowerCase()] = value; },
+      end(text) { resolve({ status: this.statusCode, body: JSON.parse(text) }); },
+    };
+    handler(req, res);
+    if (req.method === 'POST' && opts.rawBody !== undefined) {
+      req.emit('data', opts.rawBody);
+      req.emit('end');
+    }
+  });
+}
+
+const sessionState = new Map([['s1', { tier: 'high', task: '写个函数', turn: 3 }]]);
+const cache = new Map();
+const stale = { value: false };
+let manualNow = false;
+const handler = createPreviewHandler({
+  sessionState,
+  cache,
+  manual: () => manualNow,
+  stale,
+});
+
+manualNow = true;
+check('preview route: manual mode answers without judging',
+  await callPreview(handler, { rawBody: JSON.stringify({ sessionId: 's1', text: '帮我优化' }) }),
+  { status: 200, body: { mode: 'manual' } });
+manualNow = false;
+check('preview route: GET is refused', await callPreview(handler, { method: 'GET' }),
+  { status: 405, body: { error: 'method not allowed' } });
+check('preview route: empty draft is refused',
+  await callPreview(handler, { rawBody: JSON.stringify({ sessionId: 's1', text: '   ' }) }),
+  { status: 400, body: { error: 'text is empty' } });
+check('preview route: bad json is refused', await callPreview(handler, { rawBody: 'nope' }),
+  { status: 400, body: { error: 'body must be json' } });
+
+// The happy path, plus the two things the client relies on: the verdict shape, and that the
+// session's previous tier/task ride along -- otherwise a preview of "继续" would answer differently
+// from the send that follows it.
+manualNow = false;
+sent = null;
+globalThis.fetch = async (url, init) => {
+  sent = { body: JSON.parse(init.body) };
+  return { ok: true, json: async () => ({ tier: 'max', triggered_by: 'laya', preview: true }) };
+};
+try {
+  check('preview route: verdict shape',
+    await callPreview(handler, { rawBody: JSON.stringify({ sessionId: 's1', text: '  帮我设计个限流器  ' }) }),
+    { status: 200, body: { tier: 'max', triggeredBy: 'laya' } });
+  check('preview route: trimmed draft on the wire', sent.body.task, '帮我设计个限流器');
+  check('preview route: session prev pair on the wire',
+    [sent.body.prev_tier, sent.body.prev_task, sent.body.session_id], ['high', '写个函数', 's1']);
+  check('preview route: marked as a preview', sent.body.preview, true);
+  const stored = cache.get('s1');
+  check('preview route: cache entry matches what the request path will look for',
+    [stored.text, stored.prevTier, stored.prevTask, stored.tier],
+    ['帮我设计个限流器', 'high', '写个函数', 'max']);
+  check('preview route: the cached verdict is reusable by the send',
+    previewHit(stored, '帮我设计个限流器', 'high', '写个函数', Date.now()),
+    { tier: 'max', triggered_by: 'laya' });
+
+  // Unreachable judge -> a distinguishable answer, and nothing cached (there is no verdict to reuse).
+  cache.clear();
+  globalThis.fetch = async () => { throw new Error('ECONNREFUSED'); };
+  check('preview route: judge unreachable', await callPreview(handler,
+    { rawBody: JSON.stringify({ sessionId: 's1', text: '帮我设计个限流器' }) }),
+  { status: 200, body: { unavailable: true } });
+  check('preview route: nothing cached when the judge failed', cache.size, 0);
+
+  // A judge service older than this plugin answers the tier but not the flag -- i.e. it would have
+  // recorded the preview as a real judgment. Preview latches off instead of corrupting the history.
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { ok: true, json: async () => ({ tier: 'low', triggered_by: 'laya' }) };
+  };
+  check('preview route: a service without the flag is reported unsupported',
+    await callPreview(handler, { rawBody: JSON.stringify({ sessionId: 's1', text: '帮我设计个限流器' }) }),
+    { status: 200, body: { unsupported: true } });
+  check('preview route: the stale latch is set', stale.value, true);
+  check('preview route: no verdict cached from a stale service', cache.size, 0);
+  check('preview route: a latched-off route stops judging entirely',
+    await callPreview(handler, { rawBody: JSON.stringify({ sessionId: 's1', text: '再问一次' }) }),
+    { status: 200, body: { unsupported: true } });
+  check('preview route: the second answer cost no judge call', calls, 1);
+} finally {
+  globalThis.fetch = realFetch;
+}
+
+// ── preview -> send, through apply() ─────────────────────────────────────────────────────────
+// The whole point of the feature end to end: a draft judged while typing must not be judged again
+// when it is sent, while a REPEAT of the same text must be (that is a retry, and retries escalate).
+// Driven through the real `apply()` with a fake Cordis ctx, so the wiring -- session state, the
+// preview cache, and the request path -- is exercised rather than assumed.
+const appliedHandlers = new Map();
+const appliedRoutes = new Map();
+const fakeCtx = {
+  get: (key) => (key === 'webServer'
+    ? { register: (route) => { appliedRoutes.set(route.path, route); return () => {}; } }
+    : undefined),
+  on: (name, fn) => { appliedHandlers.set(name, fn); },
+  inject: (deps, callback) => { callback({ get: fakeCtx.get, effect: (fn) => { fn(); } }); },
+  effect: (fn) => { fn(); },
+};
+
+let judgeCalls = 0;
+let lastJudgeBody = null;
+globalThis.fetch = async (url, init) => {
+  const body = init !== undefined && typeof init.body === 'string' ? JSON.parse(init.body) : null;
+  if (init !== undefined && init.method === 'POST' && body !== null && body.task !== undefined) {
+    judgeCalls += 1;
+    lastJudgeBody = body;
+    const ack = body.preview === true ? { preview: true } : {};
+    return { ok: true, json: async () => ({ tier: 'high', triggered_by: 'laya', ...ack }) };
+  }
+  // The judge-service health probe: not a judge call, answer it as "nothing here".
+  return { ok: true, json: async () => ({ protocol: 'none' }) };
+};
+try {
+  apply(fakeCtx, { auto: true, autoStart: false });
+  const previewRoute = appliedRoutes.get('/router-laya/preview');
+  check('apply: the preview route is installed', previewRoute !== undefined, true);
+
+  const claimed = appliedHandlers.get('agent/inbox/claimed');
+  const request = appliedHandlers.get('agent/request');
+  check('apply: both listeners are installed', [typeof claimed, typeof request], ['function', 'function']);
+
+  const draft = '帮我设计一个分布式限流器，要能扛住区域级故障';
+  claimed({ message: { content: [{ type: 'text', text: draft }] }, agent: { session: { id: 'st' } } });
+
+  // 1) the user is typing -- the preview runs once
+  const previewed = await callPreview(previewRoute.handler,
+    { rawBody: JSON.stringify({ sessionId: 'st', text: draft }) });
+  check('apply: preview verdict reaches the chip', previewed.body, { tier: 'high', triggeredBy: 'laya' });
+  check('apply: preview judged exactly once so far', judgeCalls, 1);
+
+  // 2) the user sends it -- the cached verdict is reused, no second judge
+  const applied = await request({ turn: 1, agent: { session: { id: 'st' } } }, async () => ({}));
+  check('apply: send reuses the preview (still one judgement)', judgeCalls, 1);
+  check('apply: the send applies the previewed tier',
+    [applied.provider, applied.model, applied.reasoningEffort],
+    ['deepseek-official', 'deepseek-flash', 'high']);
+
+  // 3) the SAME text again is a retry, not a repeat of the same question: the previous task moved,
+  //    so the preview may not be reused and the judge has to see the regenerate signal itself.
+  claimed({ message: { content: [{ type: 'text', text: draft }] }, agent: { session: { id: 'st' } } });
+  await request({ turn: 2, agent: { session: { id: 'st' } } }, async () => ({}));
+  check('apply: a repeat is judged again (preview not reused)', judgeCalls, 2);
+  check('apply: the repeat carries the previous turn as prev_task',
+    [lastJudgeBody.prev_tier, lastJudgeBody.prev_task], ['high', draft]);
+  check('apply: the request path never sets the preview flag', lastJudgeBody.preview, undefined);
+} finally {
+  globalThis.fetch = realFetch;
+}
 
 // ── report ───────────────────────────────────────────────────────────────────────────────────
 console.log('='.repeat(70));

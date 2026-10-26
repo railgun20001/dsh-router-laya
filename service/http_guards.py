@@ -6,6 +6,7 @@ for `laya`, so a check that imported it could not run in CI. They live here inst
 
 1. `ExclusiveHTTPServer` -- one listening socket per port, on every platform (issue #2).
 2. `is_allowed_origin`   -- the tier chip's CORS allowlist (issue #3).
+3. `records_judgment`    -- the /state history rule the composer preview depends on.
 """
 import os
 from http.server import HTTPServer
@@ -24,6 +25,20 @@ ALLOWED_ORIGIN_PREFIXES = (
 def is_allowed_origin(origin):
     """Whether an `Origin` header value may read /state. A missing origin is refused, not defaulted."""
     return bool(origin) and origin.startswith(ALLOWED_ORIGIN_PREFIXES)
+
+
+def records_judgment(judgment, preview):
+    """Whether one /judge answer belongs in the per-session /state history.
+
+    Two conditions, the second easy to forget:
+
+    - no tier -> nothing to record (an error answer, or a base-protocol answer);
+    - `preview` -> the composer's pre-send judging. It runs the SAME inference and returns the same
+      shape, but it fires on every typing pause, so recording it would evict the 20 real turns the
+      chip's popover exists to show -- and that history would become a list of drafts, most of which
+      were never sent.
+    """
+    return bool(judgment.get("tier")) and not preview
 
 
 class ExclusiveHTTPServer(HTTPServer):

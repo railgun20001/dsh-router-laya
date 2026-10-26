@@ -17,10 +17,11 @@ jobs:
           python-version: "3.12"
       - name: install plugin test peers (schemastery + cosmokit)
         run: npm install --no-audit --no-fund
-      - name: plugin tests (arm parsing + auto state machine)
+      - name: plugin tests (arm parsing + auto state machine + composer preview)
         run: |
           node parseArm.test.mjs
           node auto.test.mjs
+          node client.test.mjs
       - name: fetch.mjs dry-run (release-first source chain)
         run: node weights/fetch.mjs --dry-run
       - name: python http guards (port exclusivity + origin allowlist, issues #2/#3)
