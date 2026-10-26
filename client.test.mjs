@@ -209,6 +209,8 @@ const HISTORY = {
 const previewCalls = [];
 let previewPending = [];
 let previewReply = { tier: 'high', triggeredBy: 'laya' };
+/** /state 轮询次数：用来断言"清空输入后立刻补拉一次"，而不是干等 3 秒周期。 */
+let statePolls = 0;
 globalThis.fetch = (url, init) => {
   const href = String(url);
   if (href === PREVIEW_URL) {
@@ -216,6 +218,7 @@ globalThis.fetch = (url, init) => {
     return new Promise((resolve) => previewPending.push(resolve));
   }
   if (href === STATE_URL) {
+    statePolls += 1;
     return Promise.resolve({ ok: true, json: async () => HISTORY });
   }
   if (href === MODE_URL) {
@@ -309,11 +312,19 @@ check('typing while a judgement is in flight never fires a second one', previewC
 await answerPreview();
 await advance(2000);
 check('at most one follow-up judgement after the settle gap', previewCalls.length <= 3, true);
+// 那次补判也要落地，芯片才会停在"预选"上（否则它连预览都没有，第 6 步就不是"发送"场景了）。
+if (previewCalls.length === 3) {
+  await answerPreview({ tier: 'low', triggeredBy: 'laya' });
+  await advance(0);
+}
 
-// ── 6. 草稿清空（发送 / 删除）后预览消失，芯片回到真实档位 ──────────────────────────────────
+// ── 6. 发送（草稿清空）后：预览退场、立刻补拉一次 /state，让补记的那一轮历史尽快出现 ─────────
+statePolls = 0;
 await setDraft('');
 await advance(5000);
 check('clearing the draft clears the preview', textOf(chipNow()), 'AUTO · 低');
+// 复用预判的那一轮由宿主补记历史；芯片不该在这条记录到达前停在"待判定"等满一个轮询周期。
+check('a clear triggers an immediate /state read', statePolls > 0, true);
 
 // ── 7. host 说预判不可用（判服务太旧）时闭嘴，不再反复请求 ────────────────────────────────
 previewReply = { unsupported: true };
