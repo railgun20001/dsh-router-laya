@@ -1,15 +1,21 @@
-"""Dependency-free HTTP guards for the judge service.
+"""Dependency-free HTTP guards and /state history rules for the judge service.
 
-Neither guard can be exercised through `laya_router.py` itself: importing that module pulls torch in
+None of this can be exercised through `laya_router.py` itself: importing that module pulls torch in
 for `laya`, so a check that imported it could not run in CI. They live here instead, stdlib-only, and
 `http_guards.test.py` pins them without a checkpoint.
 
 1. `ExclusiveHTTPServer` -- one listening socket per port, on every platform (issue #2).
 2. `is_allowed_origin`   -- the tier chip's CORS allowlist (issue #3).
 3. `records_judgment`    -- the /state history rule the composer preview depends on.
+4. `judgment_row` / `append_judgment` -- the one row shape and bounded append every path shares.
 """
 import os
+import time
+from collections import deque
 from http.server import HTTPServer
+
+# How many judgments one session keeps for the chip's popover.
+HISTORY_LIMIT = 20
 
 # Origins the tier chip may poll /state from: the web profile's page on loopback, and the DSH desktop
 # shell, which loads the GUI from its own privileged scheme instead of an http port. A prefix
@@ -39,6 +45,34 @@ def records_judgment(judgment, preview):
       were never sent.
     """
     return bool(judgment.get("tier")) and not preview
+
+
+def judgment_row(task, tier, triggered_by="", regenerate=False, ms=None, now=None):
+    """One /state history row -- the single shape every writer produces.
+
+    Shared by the two paths that add history: a `/judge` call that was actually served (the row is a
+    side effect of the judgment) and a `/record` call that commits a verdict the client obtained
+    earlier as a preview and the host then reused for the send (no second inference, but the turn
+    *did* get that tier, so it belongs in the history exactly like any other).
+    """
+    return {
+        "ts": time.time() if now is None else now,
+        "tier": tier,
+        "triggered_by": triggered_by or "",
+        "regenerate": bool(regenerate),
+        "ms": ms,
+        "task": (task or "")[:60],
+    }
+
+
+def append_judgment(history, session_id, row):
+    """Append one row to a session's bounded history, keeping the newest `HISTORY_LIMIT`.
+
+    `history` is the service's `session_id -> deque` map. A deque (not a list) so the bound is the
+    data structure's job, not a caller's `if len >` that one new writer can forget.
+    """
+    history.setdefault(session_id, deque(maxlen=HISTORY_LIMIT)).append(row)
+    return len(history[session_id])
 
 
 class ExclusiveHTTPServer(HTTPServer):

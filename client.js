@@ -48,6 +48,13 @@ window.__ModuleLoader__.load({
     const PREVIEW_DEBOUNCE_MS = 700
     const PREVIEW_SETTLE_MS = 900
     const PREVIEW_MIN_CHARS = 2
+    /**
+     * After the box is cleared (a send, mostly) pull /state once instead of waiting out the 3s poll:
+     * the host commits the reused verdict as that turn starts, so the row this turn belongs to is
+     * usually there a few hundred ms later. Without it the chip sits on "待判定" for a whole polling
+     * period, which reads like the judgment was dropped.
+     */
+    const PREVIEW_REFRESH_MS = 400
     const PREVIEW_TEXT = { low: "预选 · 低", high: "预选 · 高", max: "预选 · MAX" }
     const PREVIEW_PENDING_TEXT = "预选 · …"
     const PREVIEW_TIP = "预选档位 · 按当前输入预判（点击切到手动）"
@@ -488,11 +495,23 @@ window.__ModuleLoader__.load({
           })
       }
 
+      /** One deferred /state read after a clear, so a just-sent turn shows up without waiting 3s. */
+      const refresh = React.useState({ timer: null })[0]
+      const refreshSoon = () => {
+        if (refresh.timer !== null) return
+        refresh.timer = setTimeout(() => { refresh.timer = null; pollOnce() }, PREVIEW_REFRESH_MS)
+      }
+
       React.useEffect(() => {
         if (!previewArmed) {
           // Clearing the box (a send, an erase) clears the preview: from here the chip shows the
           // real judgment again, which for a fresh send is the tier that turn actually got.
-          if (preview[0] !== null) preview[1](null)
+          if (preview[0] !== null) {
+            preview[1](null)
+            // That judgement is now a real turn: its row is being committed right about now, so
+            // look once instead of leaving "待判定" up for a full polling period.
+            refreshSoon()
+          }
           wanted.value = null
           return undefined
         }
@@ -503,6 +522,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => () => {
         if (settle.timer !== null) clearTimeout(settle.timer)
+        if (refresh.timer !== null) clearTimeout(refresh.timer)
       }, [])
 
       // spec §3: manual shows 手动 with the pinned tier when one is known; colour returns to the default

@@ -12,7 +12,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from http.server import BaseHTTPRequestHandler  # noqa: E402
 
-from http_guards import ExclusiveHTTPServer, is_allowed_origin, records_judgment  # noqa: E402
+from http_guards import (ExclusiveHTTPServer, append_judgment, is_allowed_origin,  # noqa: E402
+                         judgment_row, records_judgment)
 
 passed = 0
 failed = []
@@ -45,6 +46,28 @@ check("a real judgement is recorded", records_judgment(tiered, False))
 check("a preview is NOT recorded", records_judgment(tiered, True), False)
 check("an answer with no tier is not recorded", records_judgment({"error": "boom"}, False), False)
 check("a preview error is not recorded", records_judgment({"error": "boom"}, True), False)
+
+# --- one row shape, one bounded append (both the judged and the recorded path go through it) ---
+row = judgment_row("帮我设计一个限流器" * 10, "high", triggered_by="laya", regenerate=True, ms=1234,
+                   now=1700000000.0)
+check("row keeps the fields the chip renders",
+      [row["ts"], row["tier"], row["triggered_by"], row["regenerate"], row["ms"]],
+      [1700000000.0, "high", "laya", True, 1234])
+check("row trims the task excerpt to 60 chars", len(row["task"]), 60)
+defaults = judgment_row("t", "low")
+check("row defaults",
+      [defaults["triggered_by"], defaults["regenerate"], defaults["ms"], defaults["task"]],
+      ["", False, None, "t"])
+
+history = {}
+check("first append creates the session history", append_judgment(history, "s1", row), 1)
+append_judgment(history, "s1", judgment_row("second", "max"))
+check("second append is the newest", history["s1"][-1]["task"], "second")
+# 20 条上限是 deque 的职责：不是每次写都记得 `if len > 20`（历史被挤爆过一次，就是因为漏了一次）。
+for index in range(30):
+    append_judgment(history, "s1", judgment_row("t%d" % index, "low"))
+check("the history stays bounded at 20", len(history["s1"]), 20)
+check("and the newest survives", history["s1"][-1]["task"], "t29")
 
 # --- one owner per port (issue #2: SO_REUSEADDR let 11 Windows judges bind :8765 at once) ---
 first = ExclusiveHTTPServer(("127.0.0.1", 0), Quiet)

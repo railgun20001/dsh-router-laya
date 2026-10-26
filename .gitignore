@@ -5,3 +5,6 @@ weights/model/
 __pycache__/
 *.pyc
 package-lock.json
+
+# 任务过程中的临时文件（AGENTS.md 约定）
+.tmp/

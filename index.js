@@ -758,6 +758,10 @@ export async function judgeTier(taskText, prevTier, prevTask, sessionId, signal,
         triggered_by: j.triggered_by || '',
         labels: j.labels || null,
         preview_ack: j.preview === true,
+        // Carried so the /record call that commits this verdict keeps the same provenance as a
+        // freshly judged turn (`ms` is the inference time the preview actually paid).
+        ms: typeof j.ms === 'number' ? j.ms : null,
+        regenerate: j.regenerate === true,
       };
     }
     return { tier: j.tier, triggered_by: j.triggered_by || '', labels: j.labels || null };
@@ -806,7 +810,51 @@ export function previewHit(entry, text, prevTier, prevTask, now, ttlMs = PREVIEW
   if (entry.prevTask !== (prevTask === undefined ? null : prevTask)) return null;
   if (typeof now !== 'number' || typeof entry.at !== 'number') return null;
   if (now - entry.at > ttlMs) return null;
-  return { tier: entry.tier, triggered_by: entry.triggered_by || '' };
+  // `ms`/`regenerate` ride along so the /record call that commits this verdict can describe it
+  // exactly like the judged path would have.
+  return {
+    tier: entry.tier,
+    triggered_by: entry.triggered_by || '',
+    ms: typeof entry.ms === 'number' ? entry.ms : null,
+    regenerate: entry.regenerate === true,
+  };
+}
+
+/**
+ * Commit one reused verdict to the judge service's /state history.
+ *
+ * The normal path records history as a side effect of `/judge`; a reused preview never calls
+ * `/judge`, so without this the turn that was actually sent would be missing from the history -- the
+ * chip would fall back to "待判定" and the popover would show nothing for it. History is "which tier
+ * did each sent turn get", not "how many inferences did we run".
+ *
+ * Best effort and off the request path: a failure costs the history row, never the turn, so the call
+ * is not awaited and its errors are one stderr line.
+ */
+export function recordJudgment(judgment, taskText, sessionId, env = process.env) {
+  if (judgment === null || judgment === undefined || typeof judgment.tier !== 'string') {
+    return Promise.resolve(false);
+  }
+  const url = `${serviceBaseUrl(env)}/record`;
+  const timeout = AbortSignal.timeout(JUDGE_TIMEOUT_MS);
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: sessionId === undefined ? null : sessionId,
+      task: (taskText === undefined || taskText === null ? '' : taskText).slice(0, JUDGE_MAX_CHARS),
+      tier: judgment.tier,
+      triggered_by: judgment.triggered_by || '',
+      regenerate: judgment.regenerate === true,
+      ms: judgment.ms === undefined ? null : judgment.ms,
+    }),
+    signal: timeout,
+  })
+    .then((res) => res.ok)
+    .catch((error) => {
+      log(`could not record the reused judgement (${error.message}) -- this turn is missing from /state`);
+      return false;
+    });
 }
 
 /**
@@ -917,6 +965,8 @@ export function createPreviewHandler(deps) {
           prevTask: prevTask === undefined ? null : prevTask,
           tier: judgment.tier,
           triggered_by: judgment.triggered_by,
+          ms: judgment.ms === undefined ? null : judgment.ms,
+          regenerate: judgment.regenerate === true,
           at: Date.now(),
         });
         if (deps.cache.size > PREVIEW_CACHE_LIMIT) {
@@ -1293,6 +1343,13 @@ export function apply(ctx, config) {
           turn,
           effort: route === null ? undefined : route.effort,
         });
+      }
+      // A reused preview never went through /judge, so nothing wrote this turn into the history the
+      // chip shows. Commit it now -- otherwise the turn the user just sent is the one turn missing
+      // from the record (and the chip stays on "待判定"). Fire and forget: history must never cost a
+      // turn. A fresh judgement needs no such call; the service recorded it itself.
+      if (preview !== null && task !== undefined) {
+        void recordJudgment(judgment, task.text, task.sessionId).catch(() => false);
       }
       log(`turn ${turn} auto "${task === undefined ? '(no task text captured)' : task.text.slice(0, 60).replace(/\s+/g, ' ')}"`
         + ` -> ${judgment === null ? 'judge unreachable -> fallback' : `${judgment.tier} (${judgment.triggered_by})`}`

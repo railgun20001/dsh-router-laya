@@ -261,7 +261,7 @@ const preview = {
 };
 check('previewHit: same three inputs -> reuse',
   previewHit(preview, '帮我优化一下', 'low', '写个函数', AT + 1000),
-  { tier: 'high', triggered_by: 'laya' });
+  { tier: 'high', triggered_by: 'laya', ms: null, regenerate: false });
 check('previewHit: edited draft -> no reuse',
   previewHit(preview, '帮我优化一下!', 'low', '写个函数', AT + 1000), null);
 check('previewHit: previous tier moved -> no reuse',
@@ -277,7 +277,7 @@ check('previewHit: no preview taken -> null',
 check('previewHit: first turn null/undefined equivalence',
   previewHit({ text: 'hi', prevTier: null, prevTask: null, tier: 'low', triggered_by: 'laya', at: AT },
     'hi', undefined, undefined, AT),
-  { tier: 'low', triggered_by: 'laya' });
+  { tier: 'low', triggered_by: 'laya', ms: null, regenerate: false });
 
 // judgeTier: the preview flag has to reach the wire -- it is what tells the Python side not to
 // append the preview to the /state history.
@@ -293,7 +293,7 @@ globalThis.fetch = async (url, init) => {
 try {
   const judged = await judgeTier('帮我优化一下', 'low', '写个函数', 's1', undefined, { preview: true });
   check('judgeTier: preview verdict parsed',
-    judged, { tier: 'high', triggered_by: 'laya', labels: null, preview_ack: true });
+    judged, { tier: 'high', triggered_by: 'laya', labels: null, preview_ack: true, ms: null, regenerate: false });
   check('judgeTier: preview flag on the wire', sent.body.preview, true);
   check('judgeTier: prev pair on the wire',
     [sent.body.prev_tier, sent.body.prev_task], ['low', '写个函数']);
@@ -372,11 +372,11 @@ try {
   check('preview route: marked as a preview', sent.body.preview, true);
   const stored = cache.get('s1');
   check('preview route: cache entry matches what the request path will look for',
-    [stored.text, stored.prevTier, stored.prevTask, stored.tier],
-    ['帮我设计个限流器', 'high', '写个函数', 'max']);
+    [stored.text, stored.prevTier, stored.prevTask, stored.tier, stored.ms, stored.regenerate],
+    ['帮我设计个限流器', 'high', '写个函数', 'max', null, false]);
   check('preview route: the cached verdict is reusable by the send',
     previewHit(stored, '帮我设计个限流器', 'high', '写个函数', Date.now()),
-    { tier: 'max', triggered_by: 'laya' });
+    { tier: 'max', triggered_by: 'laya', ms: null, regenerate: false });
 
   // Unreachable judge -> a distinguishable answer, and nothing cached (there is no verdict to reuse).
   cache.clear();
@@ -424,9 +424,16 @@ const fakeCtx = {
 
 let judgeCalls = 0;
 let lastJudgeBody = null;
+/** POST /record bodies -- the "this sent turn got tier X" commits for reused previews. */
+const recorded = [];
 globalThis.fetch = async (url, init) => {
+  const href = String(url);
   const body = init !== undefined && typeof init.body === 'string' ? JSON.parse(init.body) : null;
-  if (init !== undefined && init.method === 'POST' && body !== null && body.task !== undefined) {
+  if (href.endsWith('/record') && init !== undefined && init.method === 'POST') {
+    recorded.push(body);
+    return { ok: true, json: async () => ({ ok: true, count: 1 }) };
+  }
+  if (href.endsWith('/judge') && init !== undefined && init.method === 'POST') {
     judgeCalls += 1;
     lastJudgeBody = body;
     const ack = body.preview === true ? { preview: true } : {};
@@ -459,6 +466,12 @@ try {
   check('apply: the send applies the previewed tier',
     [applied.provider, applied.model, applied.reasoningEffort],
     ['deepseek-official', 'deepseek-flash', 'high']);
+  // ...and the turn is still written into the history the chip reads: a reused verdict skips
+  // /judge, so it must be committed explicitly. This is the defect the user saw as "待判定".
+  check('apply: the reused verdict is committed to the history once', recorded.length, 1);
+  check('apply: the recorded row describes the sent turn',
+    [recorded[0].session_id, recorded[0].task, recorded[0].tier, recorded[0].triggered_by],
+    ['st', draft, 'high', 'laya']);
 
   // 3) the SAME text again is a retry, not a repeat of the same question: the previous task moved,
   //    so the preview may not be reused and the judge has to see the regenerate signal itself.
@@ -468,6 +481,8 @@ try {
   check('apply: the repeat carries the previous turn as prev_task',
     [lastJudgeBody.prev_tier, lastJudgeBody.prev_task], ['high', draft]);
   check('apply: the request path never sets the preview flag', lastJudgeBody.preview, undefined);
+  // A freshly judged turn was recorded by the service itself; recording it again would duplicate it.
+  check('apply: a fresh judgement is not recorded twice', recorded.length, 1);
 } finally {
   globalThis.fetch = realFetch;
 }

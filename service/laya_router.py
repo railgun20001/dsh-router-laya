@@ -185,7 +185,8 @@ def http_serve(port=8765):
 
     `"preview": true` runs the same judgment but skips the /state history append, which is what the
     composer's pre-send preview needs: it fires on every typing pause and must stay invisible to the
-    tier chip's real judgment log.
+    tier chip's real judgment log. When such a verdict is later reused for the actual send, the host
+    commits it with POST /record, so the turn still appears in the history it belongs to.
 
     协议自动检测：
       LAYA_MODEL 是本地目录 → 微调协议（7 noul 含 Q7 + 意图解析 + 规则引擎含规则0 + C3 升级 → tier）
@@ -196,7 +197,8 @@ def http_serve(port=8765):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     # Dependency-free guards, kept in their own file so http_guards.test.py can pin them without the
     # torch import this module pulls in through `laya`.
-    from http_guards import ExclusiveHTTPServer, is_allowed_origin, records_judgment
+    from http_guards import (ExclusiveHTTPServer, is_allowed_origin, records_judgment,
+                             judgment_row, append_judgment)
 
     model_path = os.environ.get(
         "LAYA_MODEL",
@@ -233,7 +235,47 @@ def http_serve(port=8765):
                 self.send_header("Access-Control-Allow-Origin", origin)
                 self.send_header("Vary", "Origin")
 
+        def _json(self, code, body):
+            """One JSON reply. Used by the paths added for the composer preview."""
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _record(self):
+            """POST /record -- 把一条"已经判过"的结果补进 /state 历史。
+
+            为什么需要它：发送时若命中前端预判的缓存，这轮请求就不会再走 /judge（省掉一次 1s 级
+            推理）。但历史记录的是"发出去的这一轮判到了什么"，不是"调了几次 /judge"——不补记的话，
+            芯片会停在"待判定"、弹层里也永远没有这一轮，等于把一次真实路由从记录里抹掉了。
+
+            body: {session_id, task, tier, triggered_by, regenerate, ms}
+            """
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as e:
+                self._json(400, {"error": "body must be json: %s" % e})
+                return
+            tier = body.get("tier")
+            if not isinstance(tier, str) or tier == "":
+                self._json(400, {"error": "tier is required"})
+                return
+            session_id = body.get("session_id") or "default"
+            count = append_judgment(judge_log, session_id, judgment_row(
+                body.get("task"), tier,
+                triggered_by=body.get("triggered_by", ""),
+                regenerate=body.get("regenerate", False),
+                ms=body.get("ms"),
+            ))
+            self._json(200, {"ok": True, "session": session_id, "count": count})
+
         def do_POST(self):
+            if self.path == "/record":
+                self._record()
+                return
             if self.path != "/judge":
                 self.send_error(404)
                 return
@@ -246,7 +288,7 @@ def http_serve(port=8765):
             # 前端预览（输入框预判）：算档位，但不写 /state 的判定历史。
             # 预判是"每停一次键盘就判一次"的调用，写进去会把 20 条真实判定记录挤掉；
             # 判断本身与正式请求完全同一条路径，所以结果可以直接被随后那轮复用
-            # （见 index.js 的 previewHit）。
+            # （见 index.js 的 previewHit），复用时由宿主调 /record 补记这一轮。
             preview = bool(body.get("preview"))
             try:
                 if protocol == "finetuned":
@@ -258,16 +300,12 @@ def http_serve(port=8765):
             except Exception as e:
                 j = {"error": "%s: %s" % (type(e).__name__, e), "protocol": protocol}
             if records_judgment(j, preview):
-                from collections import deque
-                log = judge_log.setdefault(session_id, deque(maxlen=20))
-                log.append({
-                    "ts": time.time(),
-                    "tier": j["tier"],
-                    "triggered_by": j.get("triggered_by", ""),
-                    "regenerate": bool(j.get("regenerate")),
-                    "ms": j.get("ms"),
-                    "task": (task or "")[:60],
-                })
+                append_judgment(judge_log, session_id, judgment_row(
+                    task, j["tier"],
+                    triggered_by=j.get("triggered_by", ""),
+                    regenerate=j.get("regenerate", False),
+                    ms=j.get("ms"),
+                ))
             if preview:
                 j["preview"] = True
             payload = json.dumps(j, ensure_ascii=False).encode("utf-8")
